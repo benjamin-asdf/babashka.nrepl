@@ -18,7 +18,8 @@
     PushbackInputStream
     StringWriter
     Writer]
-   [java.net ServerSocket]))
+   [java.net ServerSocket]
+   [java.lang.reflect Field]))
 
 (set! *warn-on-reflection* true)
 
@@ -194,6 +195,63 @@
               [nil (str class-name) "class"])))
       imports))))
 
+(def keywords-table
+  (memoize
+   (fn []
+     (let [^Field field (.getDeclaredField clojure.lang.Keyword "table")]
+       (.setAccessible field true)
+       (.get field nil)))))
+
+(defn- tagged-candidate [c]
+  {:candidate c, :type :keyword})
+
+(defn qualified-candidates
+  "Returns a list of namespace-qualified double-colon keywords (like ::foo)
+  resolved for the given namespace."
+  [prefix ns]
+  (let [prefix (subs prefix 2)
+        ns-name (str ns)]
+    (for [[kw _] (keywords-table)
+          :when (= (namespace kw) ns-name)
+          :when (.startsWith (name kw) prefix)]
+      (tagged-candidate (str "::" (name kw))))))
+
+(defn namespace-alias-candidates
+  "Returns a list of namespace aliases prefixed by double colon required in the
+  given namespace."
+  [prefix ns]
+  (let [prefix (subs prefix 2)
+        ns-name (str ns)]
+    (for [[alias _] (ns-aliases ns)
+          :let [aname (name alias)]
+          :when (.startsWith aname prefix)]
+      (tagged-candidate (str "::" aname)))))
+
+(defn aliased-candidates
+  "Returns a list of alias-qualified double-colon keywords (like ::str/foo),
+  where alias has to be registered in the given namespace."
+  [prefix ns]
+  nil
+  ;; (when-let [[_ alias prefix] (re-matches #"::([^/]+)/(.*)" prefix)]
+  ;;   (let [alias-ns-name (str (resolve-namespace (symbol alias) ns))]
+  ;;     (for [[kw _] (keywords-table)
+  ;;           :when (= (namespace kw) alias-ns-name)
+  ;;           :when (.startsWith (name kw) prefix)]
+  ;;       (tagged-candidate (str "::" alias "/" (name kw))))))
+  )
+
+(defn candidates
+  [^String prefix, ns _]
+  (let [single-colon? (.startsWith prefix ":")
+        double-colon? (.startsWith prefix "::")
+        has-slash? (> (.indexOf prefix "/") -1)]
+    (cond (and double-colon? has-slash?) (aliased-candidates prefix ns)
+          double-colon? (concat (qualified-candidates prefix ns)
+                                (namespace-alias-candidates prefix ns))
+          single-colon? (for [[kw _] (keywords-table)
+                              :when (.startsWith (str kw) (subs prefix 1))]
+                          (tagged-candidate (str ":" kw))))))
+
 
 (defn complete [rf result {:keys [ctx msg opts]}]
   (try
@@ -209,6 +267,7 @@
                 from-current-ns (map (fn [sym]
                                        [(namespace sym) (name sym) :unqualified])
                                      from-current-ns)
+                _ (println from-current-ns)
                 alias->ns (sci/eval-string* ctx "(let [m (ns-aliases *ns*)] (zipmap (keys m) (map ns-name (vals m))))")
                 ns->alias (zipmap (vals alias->ns) (keys alias->ns))
                 from-aliased-nss (doall (mapcat
@@ -237,7 +296,14 @@
                                   svs)
                 completions (concat completions from-imports)
                 import-symbols (import-symbols->completions (:imports @(:env ctx)) query)
-                completions (concat completions import-symbols)
+
+                _ (def query query)
+                _ (def sci-ns sci-ns)
+
+                keywords (map (juxt (constantly nil) :candidate  :type) (candidates query sci-ns nil))
+
+                completions (concat completions import-symbols keywords)
+
                 completions (->> (map (fn [[namespace name type]]
                                         (cond->
                                             {"candidate" (str name)}
@@ -452,3 +518,21 @@
                                    :id "pre-init"
                                    :ctx ctx}))))
     (recur ctx listener opts)))
+
+
+(comment
+
+  (require '[sci.core :as sci])
+  (require '[sci.addons :as addons])
+
+  (def opts (-> {:namespaces {'foo.bar {'x 1}}} addons/future))
+  (def sci-ctx (sci/init opts))
+
+  (require '[babashka.nrepl.server])
+
+ (babashka.nrepl.server/start-server! sci-ctx {:host "127.0.0.1" :port 23456}))
+
+(comment
+  (candidates ":req" *ns* '_)
+  (candidates my-query my-sci-ns nil)
+  )
